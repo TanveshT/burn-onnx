@@ -15,7 +15,7 @@ use onnx_ir_derive::NodeBuilder;
 
 use crate::ir::Argument;
 
-use crate::ir::{Node, RawNode};
+use crate::ir::{ArgType, DType, Node, RawNode, TensorType};
 use crate::node::padding::{AutoPad, PaddingConfig3d, padding_config_3d};
 use crate::processor::{
     InputSpec, NodeProcessor, NodeSpec, OutputPreferences, OutputSpec, ProcessError,
@@ -36,6 +36,10 @@ pub struct MaxPool3dConfig {
     pub ceil_mode: bool,
     /// Auto padding mode
     pub auto_pad: AutoPad,
+    /// Layout of the optional Indices output: 0 flattens row-major (default), 1
+    /// column-major within each spatial volume.
+    #[new(default)]
+    pub storage_order: i64,
 }
 
 /// Node representation for MaxPool3d operation
@@ -115,6 +119,15 @@ impl NodeProcessor for MaxPool3dProcessor {
 
         crate::node::padding::pool_output_type(node)?;
 
+        // The optional Indices output holds int64 positions into the flattened input.
+        if let Some(indices) = node.outputs.get_mut(1) {
+            indices.ty = ArgType::Tensor(TensorType {
+                dtype: DType::I64,
+                rank: 5,
+                static_shape: None,
+            });
+        }
+
         Ok(())
     }
 
@@ -125,6 +138,7 @@ impl NodeProcessor for MaxPool3dProcessor {
         let mut dilations = vec![1, 1, 1];
         let mut ceil_mode: i64 = 0;
         let mut auto_pad = AutoPad::NotSet;
+        let mut storage_order = 0;
 
         for (key, value) in node.attrs.iter() {
             match key.as_str() {
@@ -134,9 +148,16 @@ impl NodeProcessor for MaxPool3dProcessor {
                 "dilations" => dilations = value.clone().into_i64s()?,
                 "ceil_mode" => ceil_mode = value.clone().into_i64()?,
                 "auto_pad" => auto_pad = AutoPad::parse(&value.clone().into_string()?)?,
-                "storage_order" => {}
+                "storage_order" => storage_order = value.clone().into_i64()?,
                 _ => {}
             }
+        }
+
+        if !matches!(storage_order, 0 | 1) {
+            return Err(ProcessError::InvalidAttribute {
+                name: "storage_order".to_string(),
+                reason: format!("expected 0 (row major) or 1 (column major), got {storage_order}"),
+            });
         }
 
         crate::node::padding::check_attr_len("kernel_shape", &kernel_shape, 3)?;
@@ -145,7 +166,7 @@ impl NodeProcessor for MaxPool3dProcessor {
 
         let padding = padding_config_3d(&pads)?;
 
-        let config = MaxPool3dConfig::new(
+        let mut config = MaxPool3dConfig::new(
             [
                 kernel_shape[0] as usize,
                 kernel_shape[1] as usize,
@@ -165,6 +186,7 @@ impl NodeProcessor for MaxPool3dProcessor {
             ceil_mode == 1,
             auto_pad,
         );
+        config.storage_order = storage_order;
 
         Ok(config)
     }
@@ -207,6 +229,68 @@ mod tests {
             builder = builder.attr_string("auto_pad", auto_pad);
         }
         builder.build()
+    }
+
+    #[test]
+    fn test_max_pool3d_indices_output_is_i64() {
+        // Declared as f32 so the test shows infer_types retypes it.
+        let mut node = TestNodeBuilder::new(NodeType::MaxPool3d, "test_indices")
+            .input_tensor_f32("data", 5, None)
+            .output_tensor_f32("output", 5, None)
+            .output_tensor_f32("indices", 5, None)
+            .attr_ints("kernel_shape", vec![2, 2, 2])
+            .build();
+        MaxPool3dProcessor
+            .infer_types(&mut node, 12, &OutputPreferences::new())
+            .unwrap();
+        assert!(matches!(
+            node.outputs[1].ty,
+            ArgType::Tensor(TensorType {
+                dtype: DType::I64,
+                rank: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_max_pool3d_storage_order() {
+        // Default row-major, column-major parsed, anything else rejected
+        let node = create_test_node(
+            vec![2, 2, 2],
+            vec![1, 1, 1],
+            vec![0; 6],
+            vec![1, 1, 1],
+            0,
+            None,
+        );
+        let config = MaxPool3dProcessor.extract_config(&node, 12).unwrap();
+        assert_eq!(config.storage_order, 0);
+
+        let mut node = create_test_node(
+            vec![2, 2, 2],
+            vec![1, 1, 1],
+            vec![0; 6],
+            vec![1, 1, 1],
+            0,
+            None,
+        );
+        node.attrs.insert(
+            "storage_order".to_string(),
+            crate::ir::AttributeValue::Int64(1),
+        );
+        let config = MaxPool3dProcessor.extract_config(&node, 12).unwrap();
+        assert_eq!(config.storage_order, 1);
+
+        node.attrs.insert(
+            "storage_order".to_string(),
+            crate::ir::AttributeValue::Int64(2),
+        );
+        let err = MaxPool3dProcessor.extract_config(&node, 12).unwrap_err();
+        assert!(
+            matches!(&err, ProcessError::InvalidAttribute { name, .. } if name == "storage_order"),
+            "{err}"
+        );
     }
 
     #[test]
