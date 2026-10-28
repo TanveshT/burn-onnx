@@ -19,6 +19,7 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
         // Determine if we have static or runtime shape
         match &self.config.shape {
             onnx_ir::reshape::ReshapeInput::Static(shape_values) => {
+                let shape_values = reshape_args(&self.config, shape_values.to_tokens());
                 // Static shape - simple reshape
                 use onnx_ir::ir::ArgType;
                 match &input_arg.ty {
@@ -48,7 +49,6 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
                                 }
                             }
                             ArgType::Tensor(_) => {
-                                let shape_values = shape_values.to_tokens();
                                 quote! {
                                     let #output = #input.reshape(#shape_values);
                                 }
@@ -112,7 +112,6 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
                             }
                             ArgType::Tensor(output_tensor) => {
                                 // Convert Shape to Tensor first, then reshape
-                                let shape_values = shape_values.to_tokens();
                                 let dtype_tokens = output_tensor.dtype.to_tokens();
                                 quote! {
                                     let #output = {
@@ -134,7 +133,6 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
                             ArgType::Tensor(tensor_type) => {
                                 // Create a 1-element tensor from scalar with explicit dtype,
                                 // then reshape to target shape (which must also be 1 element total)
-                                let shape_values = shape_values.to_tokens();
                                 let output_rank = tensor_type.rank;
                                 let dtype_tokens = tensor_type.dtype.to_tokens();
 
@@ -187,7 +185,6 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
 
                         match &output_arg.ty {
                             ArgType::Tensor(_) => {
-                                let shape_values = shape_values.to_tokens();
                                 quote! {
                                     let #output = #input.reshape(#shape_values);
                                 }
@@ -220,12 +217,13 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
                 match &shape_arg.ty {
                     ArgType::Shape(_) => {
                         let shape_name = arg_to_ident(shape_arg);
+                        let shape = reshape_args(&self.config, quote! { #shape_name });
                         quote! {
-                            let #output = #input.reshape(#shape_name);
+                            let #output = #input.reshape(#shape);
                         }
                     }
                     ArgType::Tensor(_) => {
-                        let shape_name = arg_to_ident(shape_arg);
+                        let shape_name = scope.arg(shape_arg);
                         let output_rank = match &output_arg.ty {
                             ArgType::Tensor(t) => t.rank,
                             // An empty runtime shape reshapes the single element to a scalar,
@@ -244,14 +242,17 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
                         let array_init = (0..output_rank)
                             .map(|i| {
                                 let idx = proc_macro2::Literal::usize_unsuffixed(i);
-                                quote! { shape_array[#idx] as usize }
+                                quote! { shape_array[#idx] }
                             })
                             .collect::<Vec<_>>();
+                        let shape = reshape_args(&self.config, quote! { [#(#array_init),*] });
 
                         quote! {
-                            let shape_data = #shape_name.to_data();
-                            let shape_array = shape_data.as_slice::<i64>().unwrap();
-                            let #output = #input.reshape([#(#array_init),*]);
+                            let #output = {
+                                let shape_data = #shape_name.to_data();
+                                let shape_array = shape_data.as_slice::<i64>().unwrap();
+                                #input.reshape(#shape)
+                            };
                         }
                     }
                     ArgType::ScalarNative(_) | ArgType::ScalarTensor(_) => {
@@ -272,6 +273,14 @@ impl NodeCodegen for onnx_ir::reshape::ReshapeNode {
     }
 }
 
+fn reshape_args(config: &onnx_ir::reshape::ReshapeConfig, shape: TokenStream) -> TokenStream {
+    if config.allowzero.unwrap_or(0) == 0 {
+        quote! { burn::tensor::ZeroDimPlaceholders(#shape) }
+    } else {
+        shape
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
@@ -282,9 +291,10 @@ mod tests {
 
     // Static Tensor -> Tensor reshapes
     #[test]
-    fn test_reshape_static_tensor_to_tensor() {
+    fn test_reshape_static_inferred_dimension() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Static(vec![2, 3]),
+            allowzero: None,
+            shape: ReshapeInput::Static(vec![2, -1]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("data", 3, DType::F32)
@@ -294,16 +304,17 @@ mod tests {
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
         pub fn forward(&self, data: Tensor<3>) -> Tensor<2> {
-            let reshaped = data.reshape([2, 3]);
+            let reshaped = data.reshape(burn::tensor::ZeroDimPlaceholders([2, -1]));
             reshaped
         }
         ");
     }
 
     #[test]
-    fn test_reshape_static_with_neg_one() {
+    fn test_reshape_static_with_zero_placeholder() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Static(vec![2, -1]),
+            allowzero: None,
+            shape: ReshapeInput::Static(vec![0, -1]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("tensor", 3, DType::F32)
@@ -313,27 +324,47 @@ mod tests {
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
         pub fn forward(&self, tensor: Tensor<3>) -> Tensor<2> {
-            let result = tensor.reshape([2, -1]);
+            let result = tensor.reshape(burn::tensor::ZeroDimPlaceholders([0, -1]));
             result
         }
         ");
     }
 
     #[test]
-    fn test_reshape_3d_to_1d() {
-        let config = ReshapeConfig {
-            shape: ReshapeInput::Static(vec![-1]),
-        };
+    fn test_reshape_static_literal_zero() {
         let node = ReshapeNodeBuilder::new("reshape1")
-            .input_tensor("input", 3, DType::F32)
-            .output_tensor("flattened", 1, DType::F32)
-            .config(config)
+            .input_tensor("data", 2, DType::F32)
+            .output_tensor("output", 2, DType::F32)
+            .config(ReshapeConfig {
+                shape: ReshapeInput::Static(vec![3, 0]),
+                allowzero: Some(1),
+            })
             .build();
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
-        pub fn forward(&self, input: Tensor<3>) -> Tensor<1> {
-            let flattened = input.reshape([-1]);
-            flattened
+        pub fn forward(&self, data: Tensor<2>) -> Tensor<2> {
+            let output = data.reshape([3, 0]);
+            output
+        }
+        ");
+    }
+
+    #[test]
+    fn test_reshape_runtime_shape_literal_zero() {
+        let node = ReshapeNodeBuilder::new("reshape1")
+            .input_tensor("data", 2, DType::F32)
+            .input_shape("target", 2)
+            .output_tensor("output", 2, DType::F32)
+            .config(ReshapeConfig {
+                shape: ReshapeInput::Runtime(RuntimeInputRef::new("target".into(), 1)),
+                allowzero: Some(1),
+            })
+            .build();
+        let code = codegen_forward_default(&node);
+        assert_snapshot!(code, @r"
+        pub fn forward(&self, data: Tensor<2>, target: [i64; 2]) -> Tensor<2> {
+            let output = data.reshape(target);
+            output
         }
         ");
     }
@@ -342,6 +373,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_f32() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -361,6 +393,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_f64() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -380,6 +413,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_i32() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -399,6 +433,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_i64() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -418,6 +453,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_bool() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -438,6 +474,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_scalar_i64() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -457,6 +494,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_scalar_i32() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -477,6 +515,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_shape_same_rank() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -497,6 +536,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_shape_expand() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -521,6 +561,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_shape_shrink() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -546,16 +587,17 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_tensor() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Static(vec![3]),
+            allowzero: None,
+            shape: ReshapeInput::Static(vec![0, 1]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_shape("dims", 3)
-            .output_tensor("tensor_dims", 1, DType::I64)
+            .output_tensor("tensor_dims", 2, DType::I64)
             .config(config)
             .build();
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
-        pub fn forward(&self, dims: [i64; 3]) -> Tensor<1, Int> {
+        pub fn forward(&self, dims: [i64; 3]) -> Tensor<2, Int> {
             let tensor_dims = {
                 let shape_array = dims as [i64; 3usize];
                 Tensor::<
@@ -566,7 +608,7 @@ mod tests {
                     (&self.device, burn::tensor::DType::I64),
                 )
             }
-                .reshape([3]);
+                .reshape(burn::tensor::ZeroDimPlaceholders([0, 1]));
             tensor_dims
         }
         ");
@@ -574,12 +616,10 @@ mod tests {
 
     // Runtime shape with Shape argument
     #[test]
-    fn test_reshape_runtime_with_shape_arg() {
+    fn test_reshape_runtime_shape_zero_placeholders() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Runtime(RuntimeInputRef {
-                name: "target_shape".to_string(),
-                input_index: 1,
-            }),
+            allowzero: None,
+            shape: ReshapeInput::Runtime(RuntimeInputRef::new("target_shape".into(), 1)),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("data", 3, DType::F32)
@@ -590,20 +630,17 @@ mod tests {
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
         pub fn forward(&self, data: Tensor<3>, target_shape: [i64; 2]) -> Tensor<2> {
-            let reshaped = data.reshape(target_shape);
+            let reshaped = data.reshape(burn::tensor::ZeroDimPlaceholders(target_shape));
             reshaped
         }
         ");
     }
 
-    // Runtime shape with Tensor argument (rank 2)
     #[test]
-    fn test_reshape_runtime_with_tensor_rank2() {
+    fn test_reshape_runtime_tensor_literal_zero() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Runtime(RuntimeInputRef {
-                name: "new_shape".to_string(),
-                input_index: 1,
-            }),
+            allowzero: Some(1),
+            shape: ReshapeInput::Runtime(RuntimeInputRef::new("new_shape".into(), 1)),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("x", 3, DType::F32)
@@ -614,9 +651,11 @@ mod tests {
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
         pub fn forward(&self, x: Tensor<3>, new_shape: Tensor<1, Int>) -> Tensor<2> {
-            let shape_data = new_shape.to_data();
-            let shape_array = shape_data.as_slice::<i64>().unwrap();
-            let y = x.reshape([shape_array[0] as usize, shape_array[1] as usize]);
+            let y = {
+                let shape_data = new_shape.to_data();
+                let shape_array = shape_data.as_slice::<i64>().unwrap();
+                x.reshape([shape_array[0], shape_array[1]])
+            };
             y
         }
         ");
@@ -626,10 +665,8 @@ mod tests {
     #[test]
     fn test_reshape_runtime_with_tensor_to_scalar() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Runtime(RuntimeInputRef {
-                name: "new_shape".to_string(),
-                input_index: 1,
-            }),
+            allowzero: None,
+            shape: ReshapeInput::Runtime(RuntimeInputRef::new("new_shape".into(), 1)),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("x", 1, DType::F32)
@@ -649,14 +686,11 @@ mod tests {
         ");
     }
 
-    // Runtime shape with Tensor argument (rank 3)
     #[test]
-    fn test_reshape_runtime_with_tensor_rank3() {
+    fn test_reshape_runtime_tensor_zero_placeholders() {
         let config = ReshapeConfig {
-            shape: ReshapeInput::Runtime(RuntimeInputRef {
-                name: "shape_tensor".to_string(),
-                input_index: 1,
-            }),
+            allowzero: None,
+            shape: ReshapeInput::Runtime(RuntimeInputRef::new("shape_tensor".into(), 1)),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
             .input_tensor("input", 4, DType::F32)
@@ -667,47 +701,19 @@ mod tests {
         let code = codegen_forward_default(&node);
         assert_snapshot!(code, @r"
         pub fn forward(&self, input: Tensor<4>, shape_tensor: Tensor<1, Int>) -> Tensor<3> {
-            let shape_data = shape_tensor.to_data();
-            let shape_array = shape_data.as_slice::<i64>().unwrap();
-            let output = input
-                .reshape([
-                    shape_array[0] as usize,
-                    shape_array[1] as usize,
-                    shape_array[2] as usize,
-                ]);
+            let output = {
+                let shape_data = shape_tensor.to_data();
+                let shape_array = shape_data.as_slice::<i64>().unwrap();
+                input
+                    .reshape(
+                        burn::tensor::ZeroDimPlaceholders([
+                            shape_array[0],
+                            shape_array[1],
+                            shape_array[2],
+                        ]),
+                    )
+            };
             output
-        }
-        ");
-    }
-
-    // Runtime shape with Tensor argument (rank 4)
-    #[test]
-    fn test_reshape_runtime_with_tensor_rank4() {
-        let config = ReshapeConfig {
-            shape: ReshapeInput::Runtime(RuntimeInputRef {
-                name: "dims".to_string(),
-                input_index: 1,
-            }),
-        };
-        let node = ReshapeNodeBuilder::new("reshape1")
-            .input_tensor("tensor_in", 2, DType::F32)
-            .input_tensor("dims", 1, DType::I64)
-            .output_tensor("tensor_out", 4, DType::F32)
-            .config(config)
-            .build();
-        let code = codegen_forward_default(&node);
-        assert_snapshot!(code, @r"
-        pub fn forward(&self, tensor_in: Tensor<2>, dims: Tensor<1, Int>) -> Tensor<4> {
-            let shape_data = dims.to_data();
-            let shape_array = shape_data.as_slice::<i64>().unwrap();
-            let tensor_out = tensor_in
-                .reshape([
-                    shape_array[0] as usize,
-                    shape_array[1] as usize,
-                    shape_array[2] as usize,
-                    shape_array[3] as usize,
-                ]);
-            tensor_out
         }
         ");
     }
@@ -716,6 +722,7 @@ mod tests {
     #[test]
     fn test_reshape_scalar_to_tensor_i64() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![-1]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -733,7 +740,7 @@ mod tests {
                     burn::tensor::TensorData::from([value as i64]),
                     (&self.device, burn::tensor::DType::I64),
                 )
-                .reshape([-1]);
+                .reshape(burn::tensor::ZeroDimPlaceholders([-1]));
             tensor_out
         }
         ");
@@ -742,6 +749,7 @@ mod tests {
     #[test]
     fn test_reshape_scalar_to_tensor_f32() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![1]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -758,7 +766,7 @@ mod tests {
                     burn::tensor::TensorData::from([val as f64]),
                     (&self.device, burn::tensor::DType::F32),
                 )
-                .reshape([1]);
+                .reshape(burn::tensor::ZeroDimPlaceholders([1]));
             out
         }
         ");
@@ -767,6 +775,7 @@ mod tests {
     #[test]
     fn test_reshape_scalar_to_scalar() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -787,6 +796,7 @@ mod tests {
     #[test]
     fn test_reshape_tensor_to_scalar_tensor() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
@@ -807,6 +817,7 @@ mod tests {
     #[test]
     fn test_reshape_shape_to_scalar_tensor() {
         let config = ReshapeConfig {
+            allowzero: None,
             shape: ReshapeInput::Static(vec![]),
         };
         let node = ReshapeNodeBuilder::new("reshape1")
